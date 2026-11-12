@@ -77,37 +77,84 @@ function chooseFile(): ?string
 
 $commits = [];
 $branches = [];
-$fileCommitHashes = [];
 $selectedFile = '';
+$repositoryRoot = '';
 $error = '';
-
+$diffFrom = '';
+$diffTo = '';
+$diffText = null;
 $cancelled = false;
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['choose_file'])) {
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
-        $chosenFile = chooseFile();
-        if ($chosenFile === null) {
-            $cancelled = true;
-        } else {
-            $absoluteFile = realpath($chosenFile);
-            if ($absoluteFile === false || !is_file($absoluteFile)) {
-                throw new RuntimeException('Izbrana datoteka ne obstaja ali ni običajna datoteka.');
+        if (isset($_POST['choose_file'])) {
+            $chosenFile = chooseFile();
+            if ($chosenFile === null) {
+                $cancelled = true;
+            } else {
+                $absoluteFile = realpath($chosenFile);
+                if ($absoluteFile === false || !is_file($absoluteFile)) {
+                    throw new RuntimeException('Izbrana datoteka ne obstaja ali ni običajna datoteka.');
+                }
+
+                $repositoryRoot = realpath(trim(runGit(['rev-parse', '--show-toplevel'], dirname($absoluteFile))));
+                if ($repositoryRoot === false) {
+                    throw new RuntimeException('Korenske mape Git repozitorija ni bilo mogoče najti.');
+                }
+
+                $rootPrefix = rtrim($repositoryRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+                if (!str_starts_with($absoluteFile, $rootPrefix)) {
+                    throw new RuntimeException('Izbrana datoteka ni znotraj Git repozitorija.');
+                }
+
+                $selectedFile = str_replace(
+                    DIRECTORY_SEPARATOR,
+                    '/',
+                    substr($absoluteFile, strlen($rootPrefix))
+                );
+            }
+        } elseif (isset($_POST['show_diff'])) {
+            $postedRoot = $_POST['repository_root'] ?? null;
+            if (!is_string($postedRoot) || $postedRoot === '') {
+                throw new RuntimeException('Korenske mape Git repozitorija ni mogoče preveriti.');
             }
 
-            $repositoryRoot = realpath(trim(runGit(['rev-parse', '--show-toplevel'], dirname($absoluteFile))));
+            $repositoryRoot = realpath($postedRoot);
             if ($repositoryRoot === false) {
                 throw new RuntimeException('Korenske mape Git repozitorija ni bilo mogoče najti.');
             }
 
-            $rootPrefix = rtrim($repositoryRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
-            if (!str_starts_with($absoluteFile, $rootPrefix)) {
-                throw new RuntimeException('Izbrana datoteka ni znotraj Git repozitorija.');
+            $gitRoot = realpath(trim(runGit(['rev-parse', '--show-toplevel'], $repositoryRoot)));
+            if ($gitRoot !== $repositoryRoot) {
+                throw new RuntimeException('Izbrana mapa ni korenska mapa Git repozitorija.');
             }
 
-            $selectedFile = str_replace(
-                DIRECTORY_SEPARATOR,
-                '/',
-                substr($absoluteFile, strlen($rootPrefix))
-            );
+            $postedFile = $_POST['selected_file'] ?? null;
+            if (
+                !is_string($postedFile)
+                || $postedFile === ''
+                || str_starts_with($postedFile, '/')
+                || str_contains($postedFile, "\0")
+                || in_array('..', explode('/', $postedFile), true)
+            ) {
+                throw new RuntimeException('Izbrane datoteke ni mogoče preveriti.');
+            }
+
+            $selectedFile = $postedFile;
+            $diffFrom = $_POST['diff_from'] ?? '';
+            $diffTo = $_POST['diff_to'] ?? '';
+            if (
+                !is_string($diffFrom)
+                || !is_string($diffTo)
+                || preg_match('/\A(?:[a-f0-9]{40}|[a-f0-9]{64})\z/i', $diffFrom) !== 1
+                || preg_match('/\A(?:[a-f0-9]{40}|[a-f0-9]{64})\z/i', $diffTo) !== 1
+                || $diffFrom === $diffTo
+            ) {
+                throw new RuntimeException('Izbrati je treba dve različni vozlišči grafa.');
+            }
+        }
+
+        if ($repositoryRoot !== '' && $selectedFile !== '') {
             $branchRefs = runGit([
                 'for-each-ref',
                 '--format=%(refname:short)%00%(objectname)%00%(symref)',
@@ -185,6 +232,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['choose_file'])) {
                 $commit['parents'] = array_values(array_unique($fileParents));
             }
             unset($commit);
+
+            if ($diffFrom !== '') {
+                if (!isset($historyHashes[$diffFrom], $historyHashes[$diffTo])) {
+                    throw new RuntimeException('Izbrana commita nista več prikazana v zgodovini te datoteke.');
+                }
+
+                $diffText = runGit([
+                    'diff',
+                    '--no-ext-diff',
+                    '--no-textconv',
+                    $diffFrom,
+                    $diffTo,
+                    '--',
+                    $selectedFile,
+                ], $repositoryRoot);
+            }
         }
     } catch (RuntimeException $exception) {
         $error = $exception->getMessage();
@@ -217,6 +280,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['choose_file'])) {
         .graph-node.selected { stroke: #e33; stroke-width: 4; }
         .graph-label { font: 12px system-ui, sans-serif; fill: CanvasText; }
         .graph-help { margin-top: 1rem; }
+        .diff-output { max-height: 70vh; overflow: auto; padding: 1rem; border: 1px solid #8886; border-radius: .6rem; white-space: pre; }
     </style>
 </head>
 <body>
@@ -239,11 +303,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['choose_file'])) {
             <p>Za to datoteko v Git zgodovini ni najdenih commitov.</p>
         <?php else: ?>
             <p class="muted">Graf prikazuje do 250 commitov iz zgodovine izbrane datoteke.</p>
+            <form method="post" id="diff-form" hidden>
+                <input type="hidden" name="show_diff" value="1">
+                <input type="hidden" name="repository_root" value="<?= escapeHtml($repositoryRoot) ?>">
+                <input type="hidden" name="selected_file" value="<?= escapeHtml($selectedFile) ?>">
+                <input type="hidden" name="diff_from" id="diff-from">
+                <input type="hidden" name="diff_to" id="diff-to">
+            </form>
             <div class="graph" id="graph" role="img" aria-label="Graf Git commitov in vej"></div>
             <p class="graph-help muted" id="commit-details" aria-live="polite">Izberi vozlišče za podrobnosti commita.</p>
+            <p class="graph-help muted" id="selection-help" aria-live="polite">Izberi dve vozlišči; po drugem se prikaže razlika izbrane datoteke.</p>
+            <?php if ($diffText !== null): ?>
+                <h3>Razlika: <?= escapeHtml(substr($diffFrom, 0, 12)) ?> → <?= escapeHtml(substr($diffTo, 0, 12)) ?></h3>
+                <?php if ($diffText === ''): ?>
+                    <p>Med izbranima commitoma ni sprememb izbrane datoteke.</p>
+                <?php else: ?>
+                    <pre class="diff-output"><?= escapeHtml($diffText) ?></pre>
+                <?php endif; ?>
+            <?php endif; ?>
             <script>
                 const commits = <?= json_encode($commits, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_THROW_ON_ERROR) ?>;
                 const branches = <?= json_encode($branches, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_THROW_ON_ERROR) ?>;
+                const selectedHashes = <?= json_encode($diffFrom !== '' ? [$diffFrom, $diffTo] : [], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_THROW_ON_ERROR) ?>;
+                const nodeByHash = new Map();
                 const commitByHash = new Map(commits.map(commit => [commit.hash, commit]));
                 const activeLanes = [];
                 const columns = new Map();
@@ -327,7 +409,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['choose_file'])) {
                     const cy = topOffset + index * nodeGap;
                     const node = make('circle', {
                         cx, cy, r: 7,
-                        class: 'graph-node',
+                        class: `graph-node${selectedHashes.includes(commit.hash) ? ' selected' : ''}`,
                         fill: colors[columns.get(commit.hash) % colors.length],
                         tabindex: 0,
                         role: 'button',
@@ -335,17 +417,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['choose_file'])) {
                     });
                     const title = make('title', {}, `${commit.date} ${commit.hash.slice(0, 12)} ${commit.subject}`);
                     node.append(title);
+                    nodeByHash.set(commit.hash, node);
                     const showDetails = () => {
-                        document.querySelectorAll('.graph-node.selected').forEach(selected => selected.classList.remove('selected'));
-                        node.classList.add('selected');
                         document.getElementById('commit-details').textContent =
                             `${commit.date} · ${commit.hash} · ${commit.subject}`;
                     };
-                    node.addEventListener('click', showDetails);
+                    const selectCommit = () => {
+                        if (selectedHashes.length === 2) selectedHashes.length = 0;
+                        const selectedIndex = selectedHashes.indexOf(commit.hash);
+                        if (selectedIndex === -1) {
+                            selectedHashes.push(commit.hash);
+                        } else {
+                            selectedHashes.splice(selectedIndex, 1);
+                        }
+
+                        for (const [hash, selectedNode] of nodeByHash) {
+                            selectedNode.classList.toggle('selected', selectedHashes.includes(hash));
+                        }
+
+                        const selectionHelp = document.getElementById('selection-help');
+                        if (selectedHashes.length === 0) {
+                            selectionHelp.textContent = 'Izberi dve vozlišči; po drugem se prikaže razlika izbrane datoteke.';
+                        } else if (selectedHashes.length === 1) {
+                            selectionHelp.textContent = 'Izberi še eno vozlišče za prikaz razlike.';
+                        } else {
+                            document.getElementById('diff-from').value = selectedHashes[0];
+                            document.getElementById('diff-to').value = selectedHashes[1];
+                            selectionHelp.textContent = 'Prikazujem razliko ...';
+                            document.getElementById('diff-form').requestSubmit();
+                        }
+                    };
+                    node.addEventListener('click', () => {
+                        showDetails();
+                        selectCommit();
+                    });
                     node.addEventListener('keydown', event => {
                         if (event.key === 'Enter' || event.key === ' ') {
                             event.preventDefault();
                             showDetails();
+                            selectCommit();
                         }
                     });
                     svg.append(node);
