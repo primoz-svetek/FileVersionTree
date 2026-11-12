@@ -130,10 +130,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['choose_file'])) {
             $history = runGit([
                 'log',
                 '--all',
+                '--follow',
                 '--topo-order',
                 '--date=short',
                 '--format=%H%x1f%P%x1f%ad%x1f%s',
                 '--max-count=250',
+                '--',
+                $selectedFile,
             ], $repositoryRoot);
 
             foreach (array_filter(explode("\n", trim($history)), static fn(string $line): bool => $line !== '') as $line) {
@@ -151,29 +154,43 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['choose_file'])) {
                 ];
             }
 
-            $fileHistory = runGit([
-                'log',
-                '--all',
-                '--follow',
-                '--format=%H',
-                '--',
-                $selectedFile,
-            ], $repositoryRoot);
-            $fileCommitHashes = array_fill_keys(
-                array_filter(explode("\n", trim($fileHistory)), static fn(string $hash): bool => $hash !== ''),
-                true
-            );
+            $historyHashes = array_fill_keys(array_column($commits, 'hash'), true);
+            $nearestFileCommitByParent = [];
+            foreach ($commits as &$commit) {
+                $fileParents = [];
+                foreach ($commit['parents'] as $parent) {
+                    if (isset($historyHashes[$parent])) {
+                        $fileParents[] = $parent;
+                        continue;
+                    }
+
+                    if (!array_key_exists($parent, $nearestFileCommitByParent)) {
+                        $nearestFileCommitByParent[$parent] = trim(runGit([
+                            'log',
+                            '--follow',
+                            '--format=%H',
+                            '--max-count=1',
+                            $parent,
+                            '--',
+                            $selectedFile,
+                        ], $repositoryRoot));
+                    }
+
+                    $nearestFileCommit = $nearestFileCommitByParent[$parent];
+                    if ($nearestFileCommit !== '' && isset($historyHashes[$nearestFileCommit])) {
+                        $fileParents[] = $nearestFileCommit;
+                    }
+                }
+
+                $commit['parents'] = array_values(array_unique($fileParents));
+            }
+            unset($commit);
         }
     } catch (RuntimeException $exception) {
         $error = $exception->getMessage();
     }
 }
 
-$historyHashes = array_fill_keys(array_column($commits, 'hash'), true);
-$branchesOutsideGraph = array_values(array_filter(
-    $branches,
-    static fn(array $branch): bool => !isset($historyHashes[$branch['tip']])
-));
 ?>
 <!doctype html>
 <html lang="sl">
@@ -197,11 +214,9 @@ $branchesOutsideGraph = array_values(array_filter(
         .graph-edge { fill: none; stroke-width: 3; }
         .graph-branch { font: 12px system-ui, sans-serif; }
         .graph-node { stroke: Canvas; stroke-width: 2; cursor: pointer; }
-        .graph-node.file-change { stroke: #e58b24; stroke-width: 4; }
         .graph-node.selected { stroke: #e33; stroke-width: 4; }
         .graph-label { font: 12px system-ui, sans-serif; fill: CanvasText; }
         .graph-help { margin-top: 1rem; }
-        .branch-list { display: flex; flex-wrap: wrap; gap: .5rem; list-style: none; padding: 0; }
     </style>
 </head>
 <body>
@@ -223,21 +238,12 @@ $branchesOutsideGraph = array_values(array_filter(
         <?php if ($commits === []): ?>
             <p>Za to datoteko v Git zgodovini ni najdenih commitov.</p>
         <?php else: ?>
-            <p class="muted">Graf prikazuje do 250 commitov iz vseh lokalnih in prenesenih vej. Oranžna obroba označuje commit, ki je spremenil izbrano datoteko.</p>
+            <p class="muted">Graf prikazuje do 250 commitov iz zgodovine izbrane datoteke.</p>
             <div class="graph" id="graph" role="img" aria-label="Graf Git commitov in vej"></div>
             <p class="graph-help muted" id="commit-details" aria-live="polite">Izberi vozlišče za podrobnosti commita.</p>
-            <?php if ($branchesOutsideGraph !== []): ?>
-                <h3>Veje</h3>
-                <ul class="branch-list">
-                    <?php foreach ($branchesOutsideGraph as $branch): ?>
-                        <li><?= escapeHtml($branch['name']) ?> <span class="muted">(glava ni med prikazanimi 250 commiti)</span></li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
             <script>
                 const commits = <?= json_encode($commits, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_THROW_ON_ERROR) ?>;
                 const branches = <?= json_encode($branches, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_THROW_ON_ERROR) ?>;
-                const fileCommits = new Set(<?= json_encode(array_keys($fileCommitHashes), JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_THROW_ON_ERROR) ?>);
                 const commitByHash = new Map(commits.map(commit => [commit.hash, commit]));
                 const activeLanes = [];
                 const columns = new Map();
@@ -321,7 +327,7 @@ $branchesOutsideGraph = array_values(array_filter(
                     const cy = topOffset + index * nodeGap;
                     const node = make('circle', {
                         cx, cy, r: 7,
-                        class: `graph-node${fileCommits.has(commit.hash) ? ' file-change' : ''}`,
+                        class: 'graph-node',
                         fill: colors[columns.get(commit.hash) % colors.length],
                         tabindex: 0,
                         role: 'button',
@@ -333,8 +339,7 @@ $branchesOutsideGraph = array_values(array_filter(
                         document.querySelectorAll('.graph-node.selected').forEach(selected => selected.classList.remove('selected'));
                         node.classList.add('selected');
                         document.getElementById('commit-details').textContent =
-                            `${commit.date} · ${commit.hash} · ${commit.subject}` +
-                            `${fileCommits.has(commit.hash) ? ' · spremenil je izbrano datoteko' : ''}`;
+                            `${commit.date} · ${commit.hash} · ${commit.subject}`;
                     };
                     node.addEventListener('click', showDetails);
                     node.addEventListener('keydown', event => {
